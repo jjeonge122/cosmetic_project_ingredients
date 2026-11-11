@@ -1,0 +1,14 @@
+﻿검증 항목,결과,통과 여부
+총 Formulation_Master 행 수,300,True
+고유 Formula_ID 수,300,True
+고유 Source_URL 수,300,True
+Ingredient_Detail 행 수,3869,True
+성분 없는 Formula_ID,0,True
+함량 합계 99~101%,165,True
+q.s./up to 100 포함(합계 <100 정상),130,True
+"함량 합계 이상(검토 필요): SK006, SK132, SK179, SK201, SK280",5,False
+pH 기재 처방,207,True
+제조 방법 기재 처방,298,True
+수집했지만 성분표 미파싱(제외),0,True
+접근 제한(BLOCKED) 발생,0,True
+권리 확인 필요 표시,300,True
