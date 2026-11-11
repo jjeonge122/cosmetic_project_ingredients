@@ -28,14 +28,25 @@ from openpyxl.styles import Font, PatternFill, Alignment
 from openpyxl.utils import get_column_letter
 
 BASE = "https://www.personalcaremagazine.com"
-USER_AGENT = "CosmeticFormulationResearchBot/1.0 (contact: YOUR_EMAIL)"
+USER_AGENT = "CosmeticFormulationResearchBot/1.0"
 DEFAULT_CATEGORIES = [
     f"{BASE}/formulations-by-category/33/skin-treatment",
     f"{BASE}/formulations-by-category/15/facial-care-cleansing",
     f"{BASE}/formulations-by-category/30/anti-ageing",
     f"{BASE}/formulations-by-category/31/skin-brightening",
     f"{BASE}/formulations-by-category/22/cleansing-moisturising",
+    f"{BASE}/formulations-by-category/14/body-care-cleansing",
 ]
+CATEGORY_NAMES = {
+    "33": "Skin Treatment", "15": "Facial Care/Cleansing", "30": "Anti-Ageing",
+    "31": "Skin Brightening", "22": "Cleansing/Moisturising", "14": "Body Care/Cleansing",
+}
+
+def category_name(url: str) -> str:
+    m = re.search(r"/formulations-by-category/(\d+)/([^/?#]+)", url)
+    if not m:
+        return ""
+    return CATEGORY_NAMES.get(m.group(1), m.group(2).replace("-", " ").title())
 
 @dataclass
 class Ingredient:
@@ -111,9 +122,30 @@ def get_soup(session: requests.Session, url: str, delay: float) -> BeautifulSoup
             f"접근 제한 응답({response.status_code}). 우회하지 않고 수집을 중단합니다: {url}"
         )
     response.raise_for_status()
-    if "captcha" in response.text.lower() or "verify you are human" in response.text.lower():
+    soup = BeautifulSoup(response.text, "html.parser")
+    if is_challenge_page(response.text, soup):
         raise PermissionError(f"자동화 차단/사람 확인 페이지 감지. 수집 중단: {url}")
-    return BeautifulSoup(response.text, "html.parser")
+    return soup
+
+CHALLENGE_MARKERS = (
+    "verify you are human", "are you a robot", "cf-challenge", "cf_chl_", "challenge-platform",
+    "just a moment...", "attention required!", "access denied", "please complete the security check",
+)
+
+def is_challenge_page(html: str, soup: BeautifulSoup) -> bool:
+    """실제 차단/사람 확인 페이지인지 판단.
+    회원가입·뉴스레터 폼에 들어 있는 reCAPTCHA 입력칸(정상 페이지에도 있음)은 차단으로 보지 않는다.
+    차단 페이지로 판단되면 우회하지 않고 수집을 중단한다."""
+    low = html.lower()
+    if any(m in low for m in CHALLENGE_MARKERS):
+        return True
+    title = (soup.title.get_text(" ", strip=True).lower() if soup.title else "")
+    if "captcha" in title:
+        return True
+    # 본문 콘텐츠 없이 캡차만 있는 페이지
+    if "captcha" in low and not soup.find("h1") and len(soup.get_text(" ", strip=True)) < 1500:
+        return True
+    return False
 
 def collect_detail_links(soup: BeautifulSoup, page_url: str) -> list[str]:
     links = set()
@@ -139,7 +171,8 @@ def infer_product_type(title: str, category: str = "") -> str:
 def find_value_near_label(text: str, labels: list[str]) -> str:
     for label in labels:
         m = re.search(
-            rf"{re.escape(label)}\s*[:\-]?\s*([^\n\r]+)",
+            # 단어 경계: 'pH' 가 'Phase' 안의 'ph' 에 걸리지 않도록
+            rf"(?<![A-Za-z]){re.escape(label)}(?![A-Za-z])\s*[:\-]?\s*([^\n\r]+)",
             text, flags=re.IGNORECASE
         )
         if m:
@@ -148,7 +181,10 @@ def find_value_near_label(text: str, labels: list[str]) -> str:
 
 def extract_quality(text: str) -> tuple[str, str, str, str]:
     # Conservative: capture only explicit label/value pairs.
-    ph = find_value_near_label(text, ["pH", "PH"])
+    # 'pH 5.5 – 6.5', 'pH: 5,68', 'pH value (23°C) : 5.40' → 숫자(범위)만
+    m = re.search(r"(?<![A-Za-z])pH(?:\s*value)?\s*(?:\([^)]*\))?\s*[:\-=]?\s*"
+                  r"(\d+(?:[.,]\d+)?(?:\s*[–~-]\s*\d+(?:[.,]\d+)?)?)", text)
+    ph = m.group(1) if m else find_value_near_label(text, ["pH"])
     viscosity = find_value_near_label(text, ["Viscosity"])
     appearance = find_value_near_label(text, ["Appearance", "Aspect"])
     stability = find_value_near_label(text, ["Stability", "Stable"])
@@ -249,6 +285,48 @@ def parse_ingredient_table(soup: BeautifulSoup, formula_url: str, formula_name: 
             unique.append(x)
     return unique, raw_tables
 
+def parse_ingredient_divs(soup: BeautifulSoup, formula_url: str, formula_name: str) -> list[Ingredient]:
+    """Personal Care Magazine 상세 페이지의 div 그리드 성분표.
+    <div class="formulation-method"> 안에 Phase 블록(.phase)이 있고, 각 블록의
+    .formulation-ingredients 아래 셀이 헤더(.method-heading) 개수만큼 반복된다."""
+    out: list[Ingredient] = []
+    for method in soup.select("div.formulation-method"):
+        headers = [clean(h.get_text(" ", strip=True)).lower() for h in method.select(".method-heading")]
+        if not headers:
+            continue
+
+        def idx(*terms):
+            for t in terms:
+                for i, h in enumerate(headers):
+                    if t in h:
+                        return i
+            return None
+
+        pi, ii, si, ai = idx("product", "ingredient"), idx("inci"), idx("supplier"), idx("volume", "amount", "%")
+        if pi is None or ai is None:
+            continue
+        for block in method.select("div.phase"):
+            grid = block.select_one(".formulation-ingredients")
+            if grid is None:
+                continue
+            first = block.find("div", recursive=False)
+            phase = clean(first.get_text(" ", strip=True)) if first and first is not grid else ""
+            cells = [clean(c.get_text(" ", strip=True)) for c in grid.find_all("div", recursive=False)]
+            n = len(headers)
+            for k in range(0, len(cells) - n + 1, n):
+                row = cells[k:k + n]
+                product = row[pi]
+                amount = row[ai]
+                inci_v = row[ii] if ii is not None else ""
+                # 상품명 없이 INCI·함량만 있는 행(예: Water / to 100)도 유지
+                if not (product or inci_v or amount):
+                    continue
+                out.append(Ingredient(
+                    formula_url, formula_name, phase, product,
+                    row[ii] if ii is not None else "", row[si] if si is not None else "",
+                    amount, amount_to_number(amount)))
+    return out
+
 def extract_preparation(soup: BeautifulSoup) -> str:
     # Find heading containing "Preparation" and gather following text until next major heading.
     for heading in soup.find_all(["h2", "h3", "h4", "h5", "strong", "b"]):
@@ -276,6 +354,8 @@ def parse_detail(session: requests.Session, url: str, category: str, delay: floa
 
     supplier = extract_supplier(soup)
     ingredients, raw_tables = parse_ingredient_table(soup, url, title)
+    if not ingredients:  # 표(<table>)가 아닌 div 그리드 레이아웃
+        ingredients = parse_ingredient_divs(soup, url, title)
     body_text = soup.get_text("\n", strip=True)
     ph, viscosity, appearance, stability = extract_quality(body_text)
     preparation = extract_preparation(soup)
@@ -337,13 +417,39 @@ def save_excel(formulas, ingredients, processes, logs, output: Path):
     output.parent.mkdir(parents=True, exist_ok=True)
     wb.save(output)
 
+def save_csvs(formulas, all_ingredients, processes, logs) -> None:
+    """CSV 저장. 수집 도중에도 주기적으로 호출해 중단돼도 그때까지의 결과가 남게 한다."""
+    if formulas:
+        with open("formulations_master.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=list(asdict(formulas[0]).keys()))
+            w.writeheader()
+            w.writerows(asdict(x) for x in formulas)
+    if all_ingredients:
+        with open("ingredients_detail.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.DictWriter(f, fieldnames=list(asdict(all_ingredients[0]).keys()))
+            w.writeheader()
+            w.writerows(asdict(x) for x in all_ingredients)
+    if processes:
+        with open("manufacturing_process.csv", "w", newline="", encoding="utf-8-sig") as f:
+            w = csv.writer(f)
+            w.writerow(["formula_url", "formula_name", "preparation"])
+            w.writerows(processes)
+    with open("crawl_log.csv", "w", newline="", encoding="utf-8-sig") as f:
+        w = csv.writer(f)
+        w.writerow(["url", "status", "message"])
+        w.writerows(logs)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--categories", nargs="*", default=DEFAULT_CATEGORIES,
                         help="Category/archive page URLs")
     parser.add_argument("--urls-file", default="detail_urls.txt",
                         help="Optional text file with one detail URL per line")
-    parser.add_argument("--max-pages", type=int, default=30)
+    parser.add_argument("--max-pages", type=int, default=30,
+                        help="수집할 처방 상세 페이지 최대 수")
+    parser.add_argument("--list-pages", type=int, default=1,
+                        help="카테고리별로 넘겨 볼 목록 페이지 수(?pageNumber=N). 404/새 링크 없음이면 조기 종료")
     parser.add_argument("--delay", type=float, default=3.0)
     parser.add_argument("--output", default="skincare_formulations_crawled.xlsx")
     args = parser.parse_args()
@@ -357,58 +463,88 @@ def main():
         )
 
     session = make_session()
-    detail_urls = set()
+    url_category: dict[str, str] = {}   # 상세 URL → 처음 발견된 카테고리 (삽입 순서 유지)
+    per_category: dict[str, list[str]] = {}
     logs = []
+    blocked = False
 
     # Optional user-curated list of exact detail URLs
     url_file = Path(args.urls_file)
     if url_file.exists():
+        manual = per_category.setdefault("Manual URL list", [])
         for line in url_file.read_text(encoding="utf-8").splitlines():
             line = line.strip()
-            if line and not line.startswith("#"):
-                detail_urls.add(line)
+            if line and not line.startswith("#") and line not in url_category:
+                url_category[line] = "Manual URL list"
+                manual.append(line)
 
-    # Collect detail links from selected category/archive pages.
+    # Collect detail links from category/archive pages (with pagination).
     for category_url in args.categories:
-        try:
-            soup = get_soup(session, category_url, args.delay)
-            found = collect_detail_links(soup, category_url)
-            detail_urls.update(found)
-            logs.append((category_url, "OK", f"{len(found)} detail links found"))
-        except Exception as exc:
-            logs.append((category_url, "ERROR", str(exc)))
-            logging.exception("Category failed: %s", category_url)
+        cname = category_name(category_url) or category_url
+        bucket = per_category.setdefault(cname, [])
+        for page in range(1, args.list_pages + 1):
+            page_url = category_url if page == 1 else f"{category_url.split('?')[0]}?pageNumber={page}"
+            try:
+                soup = get_soup(session, page_url, args.delay)
+            except PermissionError as exc:  # 차단/접근 제한 → 우회하지 않고 전체 중단
+                logs.append((page_url, "BLOCKED", str(exc)))
+                logging.error("접근 제한 감지, 수집 중단: %s", exc)
+                blocked = True
+                break
+            except requests.HTTPError as exc:
+                if exc.response is not None and exc.response.status_code == 404:
+                    logs.append((page_url, "END", "no more list pages"))
+                else:
+                    logs.append((page_url, "ERROR", str(exc)))
+                break
+            except Exception as exc:
+                logs.append((page_url, "ERROR", str(exc)))
+                logging.exception("Category failed: %s", page_url)
+                break
+            found = collect_detail_links(soup, page_url)
+            new = [u for u in found if u not in url_category]
+            for u in new:
+                url_category[u] = cname
+                bucket.append(u)
+            logs.append((page_url, "OK", f"{len(found)} detail links found, {len(new)} new"))
+            if not new:
+                break
+        if blocked:
+            break
 
-    detail_urls = sorted(detail_urls)[:args.max_pages]
+    # 카테고리를 번갈아 가며 선택 (한 카테고리 쏠림 방지)
+    detail_urls: list[str] = []
+    queues = [list(v) for v in per_category.values()]
+    while len(detail_urls) < args.max_pages and any(queues):
+        for q in queues:
+            if q and len(detail_urls) < args.max_pages:
+                detail_urls.append(q.pop(0))
+    logging.info("상세 페이지 %d개 수집 예정 (발견 %d개)", len(detail_urls), len(url_category))
+
     formulas, all_ingredients, processes = [], [], []
-
-    for url in detail_urls:
+    for n, url in enumerate([] if blocked else detail_urls, 1):
         try:
-            # Category provenance can be blank when URL came from manual list.
             formula, ingredients, preparation, raw_text, raw_tables = parse_detail(
-                session, url, "", args.delay
+                session, url, url_category.get(url, ""), args.delay
             )
             formulas.append(formula)
             all_ingredients.extend(ingredients)
             processes.append((url, formula.formula_name, preparation))
             logs.append((url, formula.parse_status,
                          f"ingredients={len(ingredients)}; preparation={'yes' if preparation else 'no'}"))
+        except PermissionError as exc:
+            logs.append((url, "BLOCKED", str(exc)))
+            logging.error("접근 제한 감지, 수집 중단 (%d/%d): %s", n, len(detail_urls), exc)
+            break
         except Exception as exc:
             logs.append((url, "ERROR", str(exc)))
             logging.exception("Detail failed: %s", url)
+        if n % 25 == 0:
+            logging.info("진행 %d/%d", n, len(detail_urls))
+            save_csvs(formulas, all_ingredients, processes, logs)  # 중간 저장 (중단 시 데이터 보존)
 
     save_excel(formulas, all_ingredients, processes, logs, Path(args.output))
-    # Also save machine-readable CSVs for later DB ingestion.
-    if formulas:
-        with open("formulations_master.csv", "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=list(asdict(formulas[0]).keys()))
-            w.writeheader()
-            w.writerows(asdict(x) for x in formulas)
-    if all_ingredients:
-        with open("ingredients_detail.csv", "w", newline="", encoding="utf-8-sig") as f:
-            w = csv.DictWriter(f, fieldnames=list(asdict(all_ingredients[0]).keys()))
-            w.writeheader()
-            w.writerows(asdict(x) for x in all_ingredients)
+    save_csvs(formulas, all_ingredients, processes, logs)
 
     print(f"처방 페이지: {len(formulas)}")
     print(f"성분 행: {len(all_ingredients)}")

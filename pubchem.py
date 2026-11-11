@@ -24,8 +24,8 @@ from merge_ingredients import OUT_DIR, ROOT
 
 CACHE = ROOT / "data" / "cache" / "pubchem.json"
 BASE = "https://pubchem.ncbi.nlm.nih.gov/rest"
-INTERVAL = 0.22  # 초 — 요청 시작 간격(전체 스레드 공통), 초당 약 4.5건
-WORKERS = 4      # 응답 지연을 메우기 위한 동시 요청 수
+INTERVAL = 0.4   # 초 — 요청 시작 간격(전체 스레드 공통), 초당 2.5건 (PubChem 한도 5건의 절반)
+WORKERS = 2      # 동시 요청 수 (PubChem은 요청 처리 시간 합계도 제한하므로 낮게 유지)
 PROPS = "MolecularFormula,MolecularWeight,SMILES,ConnectivitySMILES,IUPACName"
 
 _local = threading.local()
@@ -48,6 +48,10 @@ def _throttle() -> None:
         _last[0] = time.time()
 
 
+class TransientError(RuntimeError):
+    pass
+
+
 def _get(url: str, params: dict | None = None, method: str = "GET", data: dict | None = None):
     """404 → None. 503(서버 혼잡)·네트워크 오류는 지수 백오프로 재시도."""
     for attempt in range(6):
@@ -59,12 +63,19 @@ def _get(url: str, params: dict | None = None, method: str = "GET", data: dict |
             continue
         if r.status_code == 404:
             return None
-        if r.status_code in (429, 503, 504, 500):
+        if r.status_code in (429, 503):  # 과다 요청/차단 — 길게 쉬고 재시도
+            time.sleep(30 * (attempt + 1))
+            continue
+        if r.status_code in (500, 502, 504):
             time.sleep(2 ** attempt + 1)
             continue
-        r.raise_for_status()
-        return r.json()
-    return None
+        if r.status_code >= 400:  # 400 등 영구 오류: 해당 항목만 건너뜀
+            return None
+        try:
+            return r.json()
+        except ValueError:
+            return None
+    raise TransientError(url)  # 재시도 소진 — 호출 측에서 캐시하지 않고 다음 실행 때 재조회
 
 
 def load_cache() -> dict:
@@ -89,8 +100,11 @@ def _strings(o, out: list[str]) -> None:
             _strings(v, out)
 
 
-def solubility(cid: int) -> list[str]:
-    d = _get(f"{BASE}/pug_view/data/compound/{cid}/JSON", {"heading": "Solubility"})
+def solubility(cid: int) -> list[str] | None:
+    try:
+        d = _get(f"{BASE}/pug_view/data/compound/{cid}/JSON", {"heading": "Solubility"})
+    except TransientError:
+        return None  # 캐시하지 않음
     if not d:
         return []
     out: list[str] = []
@@ -113,13 +127,17 @@ def run(cas_list: list[str]) -> dict:
 
     # 1) CAS → CID
     def cid_of(cas):
-        d = _get(f"{BASE}/pug/compound/name/{cas}/cids/JSON")
+        try:
+            d = _get(f"{BASE}/pug/compound/name/{cas}/cids/JSON")
+        except TransientError:
+            return cas, None
         cids = (d or {}).get("IdentifierList", {}).get("CID", [])
         return cas, {"cid": cids[0] if cids else None, "cid_count": len(cids)}
 
     with ThreadPoolExecutor(WORKERS) as ex:
         for i, (cas, v) in enumerate(ex.map(cid_of, todo), 1):
-            cache[cas] = v
+            if v is not None:
+                cache[cas] = v
             if i % 200 == 0:
                 save_cache(cache)
                 print(f"  CID {i}/{len(todo)}", file=sys.stderr, flush=True)
@@ -130,8 +148,11 @@ def run(cas_list: list[str]) -> dict:
     props: dict[int, dict] = {}
     for i in range(0, len(need), 100):
         chunk = need[i:i + 100]
-        d = _get(f"{BASE}/pug/compound/cid/property/{PROPS}/JSON", method="POST",
-                 data={"cid": ",".join(map(str, chunk))})
+        try:
+            d = _get(f"{BASE}/pug/compound/cid/property/{PROPS}/JSON", method="POST",
+                     data={"cid": ",".join(map(str, chunk))})
+        except TransientError:
+            d = None
         for p in (d or {}).get("PropertyTable", {}).get("Properties", []):
             props[p["CID"]] = p
     for c, v in cache.items():
@@ -143,17 +164,21 @@ def run(cas_list: list[str]) -> dict:
     print(f"[pubchem] 속성 {len(props)}건", file=sys.stderr)
 
     # 3) 용해도 원문 (CID별)
-    need = [c for c in cas_list if cache[c].get("cid") and "solubility" not in cache[c]]
+    need = [c for c in cas_list if c in cache and cache[c].get("cid") and "solubility" not in cache[c]]
     with ThreadPoolExecutor(WORKERS) as ex:
         for i, (cas, sol) in enumerate(ex.map(lambda c: (c, solubility(cache[c]["cid"])), need), 1):
-            cache[cas]["solubility"] = sol
+            if sol is not None:
+                cache[cas]["solubility"] = sol
             if i % 200 == 0:
                 save_cache(cache)
                 print(f"  용해도 {i}/{len(need)}", file=sys.stderr, flush=True)
     save_cache(cache)
 
-    found = sum(bool(cache[c].get("cid")) for c in cas_list)
-    sol = sum(bool(cache[c].get("solubility")) for c in cas_list)
+    found = sum(bool(cache.get(c, {}).get("cid")) for c in cas_list)
+    sol = sum(bool(cache.get(c, {}).get("solubility")) for c in cas_list)
+    missing = sum(c not in cache for c in cas_list)
+    if missing:
+        print(f"[pubchem] 일시 오류로 미조회 {missing}건 — 다시 실행하면 이어서 조회", file=sys.stderr)
     print(f"[pubchem] 완료: CID {found}/{len(cas_list)}, 용해도 {sol}", file=sys.stderr)
     return cache
 
